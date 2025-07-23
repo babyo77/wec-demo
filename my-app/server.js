@@ -3,220 +3,346 @@ import http from "http";
 import { Server } from "socket.io";
 import * as mediasoup from "mediasoup";
 import path from "path";
-import fs from "fs";
+import fs from "fs/promises";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import cors from "cors";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const PORT = 3001;
+// Configuration constants
+const CONFIG = {
+  PORT: process.env.PORT || 3001,
+  MEDIASOUP: {
+    LOG_LEVEL: "warn",
+    LOG_TAGS: ["info", "ice", "dtls", "rtp", "srtp", "rtcp"],
+    RTC_MIN_PORT: 40000,
+    RTC_MAX_PORT: 49999,
+  },
+  HLS: {
+    FFMPEG_HOST: "127.0.0.1",
+    AUDIO_PORT: 5004,
+    VIDEO_BASE_PORT: 5008,
+    SEGMENT_DURATION: 2,
+    PLAYLIST_SIZE: 5,
+    KEYFRAME_INTERVAL: 5000,
+  },
+  TRANSPORT: {
+    listenIps: [
+      {
+        ip: "127.0.0.1",
+        announcedIp: null,
+      },
+    ],
+    enableUdp: true,
+    enableTcp: true,
+    preferUdp: true,
+    maxIncomingBitrate: 1500000,
+  },
+};
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
+  transports: ["websocket", "polling"],
 });
-app.use(cors());
 
-// Serve static files
+app.use(cors());
 app.use(express.static("public"));
 app.use("/hls", express.static("hls"));
 
-// Global variables
+// Global state
 let worker;
 let router;
 const peers = new Map();
+const rooms = new Map();
+const hlsProcesses = new Map();
 
-// Maps to store room and HLS information
-const rooms = new Map(); // Map to store room information
-const hlsProcesses = new Map(); // Map to store HLS processes
+// Enhanced logging with levels
+const logger = {
+  debug: (message, ...args) => {
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[DEBUG] ${new Date().toISOString()} - ${message}`, ...args);
+    }
+  },
+  info: (message, ...args) => {
+    console.log(`[INFO] ${new Date().toISOString()} - ${message}`, ...args);
+  },
+  error: (message, ...args) => {
+    console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, ...args);
+  },
+  warn: (message, ...args) => {
+    console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, ...args);
+  },
+};
 
-// Server port
-const PORT = process.env.PORT || 3001;
-
-// Helper function to log with timestamp
+// Legacy debug function for backward compatibility
 function debug(message, ...args) {
-  console.log(`[SERVER] ${new Date().toISOString()} - ${message}`, ...args);
+  logger.debug(message, ...args);
 }
 
-// Create HLS directory if it doesn't exist
+// Media codecs configuration
+const MEDIA_CODECS = [
+  {
+    kind: "audio",
+    mimeType: "audio/opus",
+    clockRate: 48000,
+    channels: 2,
+  },
+  {
+    kind: "video",
+    mimeType: "video/VP8",
+    clockRate: 90000,
+    parameters: {
+      "x-google-start-bitrate": 1000,
+    },
+  },
+  {
+    kind: "video",
+    mimeType: "video/H264",
+    clockRate: 90000,
+    parameters: {
+      "packetization-mode": 1,
+      "profile-level-id": "4d0032",
+      "level-asymmetry-allowed": 1,
+    },
+  },
+];
+
+// Initialize HLS directory
 const HLS_BASE_DIR = path.join(__dirname, "hls");
-if (!fs.existsSync(HLS_BASE_DIR)) {
-  fs.mkdirSync(HLS_BASE_DIR, { recursive: true });
-  debug(`Created HLS base directory: ${HLS_BASE_DIR}`);
+
+async function initializeHLSDirectory() {
+  try {
+    await fs.access(HLS_BASE_DIR);
+    logger.debug(`HLS directory already exists: ${HLS_BASE_DIR}`);
+  } catch {
+    await fs.mkdir(HLS_BASE_DIR, { recursive: true });
+    logger.info(`Created HLS base directory: ${HLS_BASE_DIR}`);
+  }
 }
 
 // Initialize MediaSoup worker and router
-const createWorker = async () => {
-  worker = await mediasoup.createWorker({
-    logLevel: "warn",
-    logTags: ["info", "ice", "dtls", "rtp", "srtp", "rtcp"],
-    rtcMinPort: 40000,
-    rtcMaxPort: 49999,
-  });
-  debug("MediaSoup worker created");
+async function createWorker() {
+  try {
+    worker = await mediasoup.createWorker({
+      logLevel: CONFIG.MEDIASOUP.LOG_LEVEL,
+      logTags: CONFIG.MEDIASOUP.LOG_TAGS,
+      rtcMinPort: CONFIG.MEDIASOUP.RTC_MIN_PORT,
+      rtcMaxPort: CONFIG.MEDIASOUP.RTC_MAX_PORT,
+    });
 
-  router = await worker.createRouter({
-    mediaCodecs: [
-      {
-        kind: "audio",
-        mimeType: "audio/opus",
-        clockRate: 48000,
-        channels: 2,
-      },
-      {
-        kind: "video",
-        mimeType: "video/VP8",
-        clockRate: 90000,
-        parameters: {
-          "x-google-start-bitrate": 1000,
-        },
-      },
-      {
-        kind: "video",
-        mimeType: "video/H264",
-        clockRate: 90000,
-        parameters: {
-          "packetization-mode": 1,
-          "profile-level-id": "4d0032",
-          "level-asymmetry-allowed": 1,
-        },
-      },
-    ],
-  });
-  debug("MediaSoup router created");
+    worker.on("died", () => {
+      logger.error("MediaSoup worker died, exiting process");
+      process.exit(1);
+    });
 
-  return router;
-};
+    logger.info("MediaSoup worker created successfully");
 
-// Call the function to initialize worker and router
-createWorker();
+    router = await worker.createRouter({ mediaCodecs: MEDIA_CODECS });
+    logger.info("MediaSoup router created successfully");
 
+    return router;
+  } catch (error) {
+    logger.error("Failed to create MediaSoup worker/router:", error);
+    throw error;
+  }
+}
+
+// Initialize server components
+async function initializeServer() {
+  try {
+    await initializeHLSDirectory();
+    await createWorker();
+    logger.info("Server initialization completed");
+  } catch (error) {
+    logger.error("Server initialization failed:", error);
+    process.exit(1);
+  }
+}
+
+// Start initialization
+initializeServer();
+
+// Utility functions
 function getPeer(socketId) {
   if (!peers.has(socketId)) {
     peers.set(socketId, {
-      transports: [],
-      producers: [],
-      consumers: [],
+      transports: new Set(),
+      producers: new Set(),
+      consumers: new Set(),
       roomId: null,
+      createdAt: Date.now(),
     });
   }
   return peers.get(socketId);
 }
 
-// HLS Functions
-async function createAudioSDP(audioConsumer, port, streamIndex = 0) {
-  if (!audioConsumer) return "";
-
-  const sdpLines = [];
-  sdpLines.push(`v=0`);
-  sdpLines.push(`o=mediasoup 0 0 IN IP4 127.0.0.1`);
-  sdpLines.push(`s=Audio Stream ${streamIndex + 1}`);
-  sdpLines.push(`c=IN IP4 127.0.0.1`);
-  sdpLines.push(`t=0 0`);
-
-  const baseCodec = audioConsumer.rtpParameters.codecs[0];
-  const payloadType = baseCodec.payloadType;
-  const clockRate = baseCodec.clockRate;
-  const channels = baseCodec.channels || 2;
-
-  // Media description
-  sdpLines.push(`m=audio ${port} RTP/AVP ${payloadType}`);
-
-  // Handle OPUS codec specifically
-  if (baseCodec.mimeType.toLowerCase().includes("opus")) {
-    sdpLines.push(`a=rtpmap:${payloadType} opus/${clockRate}/${channels}`);
-    sdpLines.push(
-      `a=fmtp:${payloadType} minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxplaybackrate=48000;cbr=1`
-    );
-  } else {
-    const codecMime = baseCodec.mimeType.split("/")[1];
-    sdpLines.push(
-      `a=rtpmap:${payloadType} ${codecMime}/${clockRate}${
-        channels > 1 ? `/${channels}` : ""
-      }`
-    );
+function validateConsumer(consumer) {
+  if (!consumer || !consumer.rtpParameters || !consumer.rtpParameters.codecs) {
+    throw new Error("Invalid consumer or missing RTP parameters");
   }
-
-  // RTCP and direction
-  sdpLines.push(`a=rtcp:${port + 1} IN IP4 127.0.0.1`);
-  sdpLines.push(`a=sendonly`);
-  sdpLines.push(`a=control:streamid=${streamIndex}`);
-  sdpLines.push(`a=ts-refclk:local`);
-  sdpLines.push(`a=ptime:20`);
-  sdpLines.push(`a=x-receivebuffer:4096`);
-
-  return sdpLines.join("\n") + "\n";
+  return consumer.rtpParameters.codecs[0];
 }
 
-async function createVideoSDP(videoConsumer, port, streamIndex = 0) {
-  const sdpLines = [];
-  sdpLines.push(`v=0`);
-  sdpLines.push(`o=mediasoup 0 0 IN IP4 127.0.0.1`);
-  sdpLines.push(`s=Video Stream ${streamIndex + 1}`);
-  sdpLines.push(`c=IN IP4 127.0.0.1`);
-  sdpLines.push(`t=0 0`);
-
-  const rtpParams = videoConsumer.rtpParameters;
-  const codec = rtpParams.codecs[0];
-  const payloadType = codec.payloadType;
-
-  // Media description
-  sdpLines.push(`m=video ${port} RTP/AVP ${payloadType}`);
-
-  // Handle H264 or VP8 codec
-  if (codec.mimeType.toLowerCase().includes("h264")) {
-    sdpLines.push(`a=rtpmap:${payloadType} H264/90000`);
-
-    let fmtpParams = [];
-    if (codec.parameters) {
-      const profileLevelId = codec.parameters["profile-level-id"] || "42e01e";
-      fmtpParams.push(`profile-level-id=${profileLevelId}`);
-
-      const packetizationMode = codec.parameters["packetization-mode"] || "1";
-      fmtpParams.push(`packetization-mode=${packetizationMode}`);
-
-      if (codec.parameters["level-asymmetry-allowed"]) {
-        fmtpParams.push(
-          `level-asymmetry-allowed=${codec.parameters["level-asymmetry-allowed"]}`
-        );
-      }
-    } else {
-      fmtpParams.push("profile-level-id=42e01e");
-      fmtpParams.push("packetization-mode=1");
-    }
-
-    sdpLines.push(`a=fmtp:${payloadType} ${fmtpParams.join(";")}`);
-  } else if (codec.mimeType.toLowerCase().includes("vp8")) {
-    sdpLines.push(`a=rtpmap:${payloadType} VP8/90000`);
+// Optimized HLS SDP creation functions
+function createAudioSDP(audioConsumer, port, streamIndex = 0) {
+  if (!audioConsumer) {
+    logger.warn("No audio consumer provided for SDP creation");
+    return "";
   }
 
-  // RTCP and direction
-  sdpLines.push(`a=rtcp:${port + 1} IN IP4 127.0.0.1`);
-  sdpLines.push(`a=sendonly`);
+  try {
+    const baseCodec = validateConsumer(audioConsumer);
+    const { payloadType, clockRate, mimeType } = baseCodec;
+    const channels = baseCodec.channels || 2;
 
-  return sdpLines.join("\n") + "\n";
+    const sdpLines = [
+      "v=0",
+      "o=mediasoup 0 0 IN IP4 127.0.0.1",
+      `s=Audio Stream ${streamIndex + 1}`,
+      "c=IN IP4 127.0.0.1",
+      "t=0 0",
+      `m=audio ${port} RTP/AVP ${payloadType}`,
+    ];
+
+    // Codec-specific configuration
+    if (mimeType.toLowerCase().includes("opus")) {
+      sdpLines.push(
+        `a=rtpmap:${payloadType} opus/${clockRate}/${channels}`,
+        `a=fmtp:${payloadType} minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxplaybackrate=48000;cbr=1`
+      );
+    } else {
+      const codecName = mimeType.split("/")[1];
+      const channelSuffix = channels > 1 ? `/${channels}` : "";
+      sdpLines.push(
+        `a=rtpmap:${payloadType} ${codecName}/${clockRate}${channelSuffix}`
+      );
+    }
+
+    // Common attributes
+    sdpLines.push(
+      `a=rtcp:${port + 1} IN IP4 127.0.0.1`,
+      "a=sendonly",
+      `a=control:streamid=${streamIndex}`,
+      "a=ts-refclk:local",
+      "a=ptime:20",
+      "a=x-receivebuffer:4096"
+    );
+
+    return sdpLines.join("\n") + "\n";
+  } catch (error) {
+    logger.error("Error creating audio SDP:", error);
+    return "";
+  }
+}
+
+function createVideoSDP(videoConsumer, port, streamIndex = 0) {
+  if (!videoConsumer) {
+    logger.warn("No video consumer provided for SDP creation");
+    return "";
+  }
+
+  try {
+    const codec = validateConsumer(videoConsumer);
+    const { payloadType, mimeType, parameters = {} } = codec;
+
+    const sdpLines = [
+      "v=0",
+      "o=mediasoup 0 0 IN IP4 127.0.0.1",
+      `s=Video Stream ${streamIndex + 1}`,
+      "c=IN IP4 127.0.0.1",
+      "t=0 0",
+      `m=video ${port} RTP/AVP ${payloadType}`,
+    ];
+
+    // Codec-specific configuration
+    if (mimeType.toLowerCase().includes("h264")) {
+      sdpLines.push(`a=rtpmap:${payloadType} H264/90000`);
+
+      const fmtpParams = [
+        `profile-level-id=${parameters["profile-level-id"] || "42e01e"}`,
+        `packetization-mode=${parameters["packetization-mode"] || "1"}`,
+      ];
+
+      if (parameters["level-asymmetry-allowed"]) {
+        fmtpParams.push(
+          `level-asymmetry-allowed=${parameters["level-asymmetry-allowed"]}`
+        );
+      }
+
+      sdpLines.push(`a=fmtp:${payloadType} ${fmtpParams.join(";")}`);
+    } else if (mimeType.toLowerCase().includes("vp8")) {
+      sdpLines.push(`a=rtpmap:${payloadType} VP8/90000`);
+    }
+
+    // Common attributes
+    sdpLines.push(`a=rtcp:${port + 1} IN IP4 127.0.0.1`, "a=sendonly");
+
+    return sdpLines.join("\n") + "\n";
+  } catch (error) {
+    logger.error("Error creating video SDP:", error);
+    return "";
+  }
 }
 
 async function startHLS(roomId) {
-  debug(`Starting HLS for room ${roomId}`);
+  logger.info(`Starting HLS for room ${roomId}`);
 
   if (hlsProcesses.has(roomId)) {
-    debug(`HLS already started for room ${roomId}`);
-    return;
+    logger.warn(`HLS already started for room ${roomId}`);
+    return hlsProcesses.get(roomId);
   }
 
   const room = rooms.get(roomId);
-  if (!room || !room.producers || room.producers.size === 0) {
-    debug(`No producers found in room ${roomId}`);
-    throw new Error("No producers found for HLS");
+  if (!room?.producers || room.producers.size === 0) {
+    const error = new Error(`No producers found in room ${roomId}`);
+    logger.error(error.message);
+    throw error;
   }
 
+  const { audioProducers, videoProducers } = collectProducers(room);
+
+  logger.debug(
+    `Found ${audioProducers.length} audio and ${videoProducers.length} video producers`
+  );
+
+  if (audioProducers.length === 0 || videoProducers.length === 0) {
+    const error = new Error(
+      "Need at least one audio and one video producer for HLS"
+    );
+    logger.error(error.message);
+    throw error;
+  }
+
+  const resources = {
+    transports: [],
+    consumers: [],
+    outputDir: null,
+    ffmpegProcess: null,
+  };
+
+  try {
+    return await createHLSStream(
+      roomId,
+      audioProducers,
+      videoProducers,
+      resources
+    );
+  } catch (error) {
+    logger.error(`Failed to start HLS for room ${roomId}:`, error);
+    await cleanupHLSResources(resources);
+    throw error;
+  }
+}
+
+function collectProducers(room) {
   const audioProducers = [];
   const videoProducers = [];
 
-  // Collect all producers from the room
-  for (const [_, producers] of room.producers) {
+  for (const producers of room.producers.values()) {
     for (const producer of producers) {
       if (producer.kind === "audio") {
         audioProducers.push(producer);
@@ -226,309 +352,368 @@ async function startHLS(roomId) {
     }
   }
 
-  debug(
-    `Found ${audioProducers.length} audio producers and ${videoProducers.length} video producers`
+  return { audioProducers, videoProducers };
+}
+
+async function createHLSStream(
+  roomId,
+  audioProducers,
+  videoProducers,
+  resources
+) {
+  // Setup output directory
+  const outputDir = path.join(HLS_BASE_DIR, roomId);
+  resources.outputDir = outputDir;
+
+  await setupOutputDirectory(outputDir);
+
+  // Create consumers and transports
+  const { audioConsumers, videoConsumers } = await createConsumersAndTransports(
+    audioProducers,
+    videoProducers,
+    resources
   );
 
-  if (audioProducers.length === 0 || videoProducers.length === 0) {
-    debug(`Not enough producers to start HLS`);
-    throw new Error("Need at least one audio and one video producer for HLS");
+  // Generate SDP files
+  await generateSDPFiles(audioConsumers, videoConsumers, outputDir);
+
+  // Start FFmpeg process
+  const ffmpegProcess = await startFFmpegProcess(
+    audioConsumers,
+    videoConsumers,
+    outputDir
+  );
+  resources.ffmpegProcess = ffmpegProcess;
+
+  // Store HLS process data
+  const hlsData = {
+    ffmpegProcess,
+    audioTransports: resources.transports.filter(
+      (_, i) => i < audioConsumers.length
+    ),
+    videoTransports: resources.transports.filter(
+      (_, i) => i >= audioConsumers.length
+    ),
+    audioConsumers,
+    videoConsumers,
+    outputDir,
+  };
+
+  hlsProcesses.set(roomId, hlsData);
+
+  // Resume consumers and setup keyframe requests
+  await setupConsumerResumption(audioConsumers, videoConsumers, roomId);
+
+  logger.info(`HLS started successfully for room ${roomId}`);
+  return {
+    playlistPath: `hls/${roomId}/index.m3u8`,
+    outputDir,
+  };
+}
+
+async function setupOutputDirectory(outputDir) {
+  try {
+    await fs.access(outputDir);
+    await fs.rm(outputDir, { recursive: true, force: true });
+  } catch {
+    // Directory doesn't exist, which is fine
+  }
+  await fs.mkdir(outputDir, { recursive: true });
+  logger.debug(`Created output directory: ${outputDir}`);
+}
+
+async function createConsumersAndTransports(
+  audioProducers,
+  videoProducers,
+  resources
+) {
+  const maxStreams = 2;
+  const audioConsumers = [];
+  const videoConsumers = [];
+
+  // Create audio consumers
+  for (let i = 0; i < Math.min(audioProducers.length, maxStreams); i++) {
+    const port = CONFIG.HLS.AUDIO_PORT + i * 2;
+    const { transport, consumer } = await createPlainTransportAndConsumer(
+      audioProducers[i],
+      port
+    );
+    resources.transports.push(transport);
+    resources.consumers.push(consumer);
+    audioConsumers.push(consumer);
   }
 
-  // Define FFmpeg listening IPs and Ports
-  const FFMPEG_HOST = "127.0.0.1";
-  const FFMPEG_AUDIO_PORT = 5004;
-  const FFMPEG_VIDEO_BASE_PORT = 5008;
+  // Create video consumers
+  for (let i = 0; i < Math.min(videoProducers.length, maxStreams); i++) {
+    const port = CONFIG.HLS.VIDEO_BASE_PORT + i * 4;
+    const { transport, consumer } = await createPlainTransportAndConsumer(
+      videoProducers[i],
+      port
+    );
+    resources.transports.push(transport);
+    resources.consumers.push(consumer);
+    videoConsumers.push(consumer);
 
-  // Arrays to store all transports and consumers for cleanup
-  const allTransports = [];
-  const allConsumers = [];
+    // Request initial keyframe
+    consumer.requestKeyFrame();
+  }
 
-  try {
-    // Create output directory
-    const outputDir = path.join(HLS_BASE_DIR, roomId);
-    if (fs.existsSync(outputDir)) {
-      fs.rmSync(outputDir, { recursive: true, force: true });
-    }
-    fs.mkdirSync(outputDir, { recursive: true });
-    debug(`Created output directory: ${outputDir}`);
+  return { audioConsumers, videoConsumers };
+}
 
-    // Create audio transports and consumers
-    const audioTransports = [];
-    const audioConsumers = [];
+async function createPlainTransportAndConsumer(producer, port) {
+  const transport = await router.createPlainTransport({
+    listenIp: { ip: CONFIG.HLS.FFMPEG_HOST, announcedIp: undefined },
+    enableSctp: false,
+    comedia: false,
+    rtcpMux: false,
+  });
 
-    for (let i = 0; i < Math.min(audioProducers.length, 2); i++) {
-      const audioPort = FFMPEG_AUDIO_PORT + i * 2;
-      const audioTransport = await router.createPlainTransport({
-        listenIp: { ip: FFMPEG_HOST, announcedIp: undefined },
-        enableSctp: false,
-        comedia: false,
-        rtcpMux: false,
-      });
+  await transport.connect({
+    ip: CONFIG.HLS.FFMPEG_HOST,
+    port,
+    rtcpPort: port + 1,
+  });
 
-      audioTransports.push(audioTransport);
-      allTransports.push(audioTransport);
+  const consumer = await transport.consume({
+    producerId: producer.id,
+    rtpCapabilities: router.rtpCapabilities,
+    paused: true,
+  });
 
-      await audioTransport.connect({
-        ip: FFMPEG_HOST,
-        port: audioPort,
-        rtcpPort: audioPort + 1,
-      });
+  return { transport, consumer };
+}
 
-      const audioConsumer = await audioTransport.consume({
-        producerId: audioProducers[i].id,
-        rtpCapabilities: router.rtpCapabilities,
-        paused: true,
-      });
+async function generateSDPFiles(audioConsumers, videoConsumers, outputDir) {
+  const sdpPromises = [];
 
-      audioConsumers.push(audioConsumer);
-      allConsumers.push(audioConsumer);
-    }
+  // Generate audio SDP files
+  audioConsumers.forEach((consumer, i) => {
+    const port = CONFIG.HLS.AUDIO_PORT + i * 2;
+    const sdpContent = createAudioSDP(consumer, port, i);
+    const filePath = path.join(outputDir, `audio${i + 1}.sdp`);
+    sdpPromises.push(fs.writeFile(filePath, sdpContent));
+  });
 
-    // Create video transports and consumers
-    const videoTransports = [];
-    const videoConsumers = [];
+  // Generate video SDP files
+  videoConsumers.forEach((consumer, i) => {
+    const port = CONFIG.HLS.VIDEO_BASE_PORT + i * 4;
+    const sdpContent = createVideoSDP(consumer, port, i);
+    const filePath = path.join(outputDir, `video${i + 1}.sdp`);
+    sdpPromises.push(fs.writeFile(filePath, sdpContent));
+  });
 
-    for (let i = 0; i < Math.min(videoProducers.length, 2); i++) {
-      const videoPort = FFMPEG_VIDEO_BASE_PORT + i * 4;
-      const videoTransport = await router.createPlainTransport({
-        listenIp: { ip: FFMPEG_HOST, announcedIp: undefined },
-        enableSctp: false,
-        comedia: false,
-        rtcpMux: false,
-      });
+  await Promise.all(sdpPromises);
+  logger.debug("SDP files generated successfully");
+}
 
-      videoTransports.push(videoTransport);
-      allTransports.push(videoTransport);
+async function startFFmpegProcess(audioConsumers, videoConsumers, outputDir) {
+  const ffmpegArgs = buildFFmpegArgs(audioConsumers, videoConsumers, outputDir);
 
-      await videoTransport.connect({
-        ip: FFMPEG_HOST,
-        port: videoPort,
-        rtcpPort: videoPort + 1,
-      });
+  const ffmpegProcess = spawn("ffmpeg", ffmpegArgs, {
+    cwd: outputDir,
+    detached: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
 
-      const videoConsumer = await videoTransport.consume({
-        producerId: videoProducers[i].id,
-        rtpCapabilities: router.rtpCapabilities,
-        paused: true,
-      });
+  setupFFmpegEventHandlers(ffmpegProcess, outputDir);
+  return ffmpegProcess;
+}
 
-      videoConsumers.push(videoConsumer);
-      allConsumers.push(videoConsumer);
+function buildFFmpegArgs(audioConsumers, videoConsumers, outputDir) {
+  const ffmpegArgs = [
+    "-loglevel",
+    "error",
+    "-y",
+    "-fflags",
+    "+genpts+discardcorrupt+nobuffer",
+    "-avoid_negative_ts",
+    "make_zero",
+    "-thread_queue_size",
+    "1024",
+    "-protocol_whitelist",
+    "file,udp,rtp,rtcp,crypto,data",
+  ];
 
-      // Request keyframes
-      videoConsumer.requestKeyFrame();
-    }
-
-    // Create SDP files
-    for (let i = 0; i < audioConsumers.length; i++) {
-      const audioPort = FFMPEG_AUDIO_PORT + i * 2;
-      const audioSDP = await createAudioSDP(audioConsumers[i], audioPort, i);
-      fs.writeFileSync(path.join(outputDir, `audio${i + 1}.sdp`), audioSDP);
-    }
-
-    for (let i = 0; i < videoConsumers.length; i++) {
-      const videoPort = FFMPEG_VIDEO_BASE_PORT + i * 4;
-      const videoSDP = await createVideoSDP(videoConsumers[i], videoPort, i);
-      fs.writeFileSync(path.join(outputDir, `video${i + 1}.sdp`), videoSDP);
-    }
-
-    // Build FFmpeg command
-    const ffmpegArgs = [
-      "-loglevel",
-      "debug",
-      "-y",
-
-      // Global options
-      "-fflags",
-      "+genpts+discardcorrupt+nobuffer",
-      "-avoid_negative_ts",
-      "make_zero",
-      "-thread_queue_size",
-      "1024",
+  // Add audio inputs
+  audioConsumers.forEach((_, i) => {
+    ffmpegArgs.push(
       "-protocol_whitelist",
       "file,udp,rtp,rtcp,crypto,data",
-    ];
-
-    // Add audio inputs
-    for (let i = 0; i < audioConsumers.length; i++) {
-      ffmpegArgs.push("-protocol_whitelist", "file,udp,rtp,rtcp,crypto,data");
-      ffmpegArgs.push("-f", "sdp");
-      ffmpegArgs.push("-c:a", "libopus");
-      ffmpegArgs.push("-i", path.join(outputDir, `audio${i + 1}.sdp`));
-    }
-
-    // Add video inputs
-    for (let i = 0; i < videoConsumers.length; i++) {
-      ffmpegArgs.push("-protocol_whitelist", "file,udp,rtp,rtcp,crypto,data");
-      ffmpegArgs.push("-f", "sdp");
-      ffmpegArgs.push("-i", path.join(outputDir, `video${i + 1}.sdp`));
-    }
-
-    // Add filter complex for audio mixing and video layout
-    const firstVideoInputIndex = audioConsumers.length;
-    let filterComplexString = "";
-
-    // Audio mixing
-    if (audioConsumers.length > 0) {
-      if (audioConsumers.length > 1) {
-        filterComplexString = `[0:a][1:a]amix=inputs=2[audio_out];`;
-      } else {
-        filterComplexString = `[0:a]aresample=48000[audio_out];`;
-      }
-    } else {
-      filterComplexString =
-        "anullsrc=channel_layout=stereo:sample_rate=48000[audio_out];";
-    }
-
-    // Video layout (side-by-side if 2 videos)
-    if (videoConsumers.length === 2) {
-      filterComplexString +=
-        `[${firstVideoInputIndex}:v]scale=640:480[left];` +
-        `[${firstVideoInputIndex + 1}:v]scale=640:480[right];` +
-        `[left][right]hstack=inputs=2[video_out]`;
-    } else if (videoConsumers.length === 1) {
-      filterComplexString += `[${firstVideoInputIndex}:v]scale=1280:720[video_out]`;
-    }
-
-    ffmpegArgs.push("-filter_complex", filterComplexString);
-    ffmpegArgs.push("-map", "[audio_out]", "-map", "[video_out]");
-
-    // Add encoding and HLS settings
-    ffmpegArgs.push(
-      // Audio encoding
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k",
-      "-ar",
-      "48000",
-      "-ac",
-      "2",
-
-      // Video encoding
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-tune",
-      "zerolatency",
-      "-profile:v",
-      "main",
-      "-level",
-      "4.0",
-      "-b:v",
-      "1500k",
-      "-maxrate",
-      "1800k",
-      "-bufsize",
-      "3000k",
-      "-g",
-      "48",
-      "-keyint_min",
-      "48",
-      "-sc_threshold",
-      "0",
-      "-r",
-      "24",
-
-      // HLS settings
       "-f",
-      "hls",
-      "-hls_time",
-      "2",
-      "-hls_list_size",
-      "5",
-      "-hls_flags",
-      "delete_segments+append_list+discont_start+omit_endlist",
-      "-hls_delete_threshold",
-      "1",
-      "-hls_segment_type",
-      "mpegts",
-      "-hls_segment_filename",
-      path.join(outputDir, "segment_%d.ts"),
-      path.join(outputDir, "index.m3u8")
+      "sdp",
+      "-c:a",
+      "libopus",
+      "-i",
+      path.join(outputDir, `audio${i + 1}.sdp`)
     );
+  });
 
-    // Spawn FFmpeg process
-    const ffmpegProcess = spawn("ffmpeg", ffmpegArgs, {
-      cwd: outputDir,
-      detached: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+  // Add video inputs
+  videoConsumers.forEach((_, i) => {
+    ffmpegArgs.push(
+      "-protocol_whitelist",
+      "file,udp,rtp,rtcp,crypto,data",
+      "-f",
+      "sdp",
+      "-i",
+      path.join(outputDir, `video${i + 1}.sdp`)
+    );
+  });
 
-    ffmpegProcess.stdout.on("data", (data) => {
-      debug(`FFmpeg stdout: ${data.toString()}`);
-    });
+  // Add filter complex
+  const filterComplex = buildFilterComplex(
+    audioConsumers.length,
+    videoConsumers.length
+  );
+  ffmpegArgs.push("-filter_complex", filterComplex);
+  ffmpegArgs.push("-map", "[audio_out]", "-map", "[video_out]");
 
-    ffmpegProcess.stderr.on("data", (data) => {
-      debug(`FFmpeg stderr: ${data.toString()}`);
-    });
+  // Add encoding and HLS settings
+  ffmpegArgs.push(
+    "-c:a",
+    "aac",
+    "-b:a",
+    "192k",
+    "-ar",
+    "48000",
+    "-ac",
+    "2",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-tune",
+    "zerolatency",
+    "-profile:v",
+    "main",
+    "-level",
+    "4.0",
+    "-b:v",
+    "1500k",
+    "-maxrate",
+    "1800k",
+    "-bufsize",
+    "3000k",
+    "-g",
+    "48",
+    "-keyint_min",
+    "48",
+    "-sc_threshold",
+    "0",
+    "-r",
+    "24",
+    "-f",
+    "hls",
+    "-hls_time",
+    CONFIG.HLS.SEGMENT_DURATION.toString(),
+    "-hls_list_size",
+    CONFIG.HLS.PLAYLIST_SIZE.toString(),
+    "-hls_flags",
+    "delete_segments+append_list+discont_start+omit_endlist",
+    "-hls_delete_threshold",
+    "1",
+    "-hls_segment_type",
+    "mpegts",
+    "-hls_segment_filename",
+    path.join(outputDir, "segment_%d.ts"),
+    path.join(outputDir, "index.m3u8")
+  );
 
-    ffmpegProcess.on("close", (code) => {
-      debug(`FFmpeg process for room ${roomId} exited with code ${code}`);
-      stopHLS(roomId);
-    });
+  return ffmpegArgs;
+}
 
-    ffmpegProcess.on("error", (err) => {
-      debug(
-        `Failed to start FFmpeg process for room ${roomId}: ${err.message}`
-      );
-      stopHLS(roomId);
-    });
+function buildFilterComplex(audioCount, videoCount) {
+  let filterComplex = "";
 
-    // Store process info
-    hlsProcesses.set(roomId, {
-      ffmpegProcess,
-      audioTransports,
-      videoTransports,
-      audioConsumers,
-      videoConsumers,
-      outputDir,
-    });
-
-    // Resume consumers after a delay
-    setTimeout(async () => {
-      try {
-        for (const consumer of allConsumers) {
-          if (consumer.kind === "video") {
-            await consumer.requestKeyFrame();
-            await new Promise((resolve) => setTimeout(resolve, 500));
-          }
-          await consumer.resume();
-          debug(`Resumed consumer ${consumer.id}`);
-        }
-        debug(`All consumers resumed for room ${roomId}`);
-
-        // Set up periodic keyframe requests
-        const keyframeInterval = setInterval(() => {
-          videoConsumers.forEach((consumer) => {
-            consumer.requestKeyFrame();
-          });
-        }, 5000);
-
-        // Store the interval for cleanup
-        const hlsProcess = hlsProcesses.get(roomId);
-        if (hlsProcess) {
-          hlsProcess.keyframeInterval = keyframeInterval;
-        }
-      } catch (error) {
-        debug(`Error resuming consumers: ${error.message}`);
-      }
-    }, 3000);
-
-    debug(`HLS started for room ${roomId}`);
-    return {
-      playlistPath: `hls/${roomId}/index.m3u8`,
-      outputDir,
-    };
-  } catch (error) {
-    debug(`Error during HLS setup: ${error.message}`);
-    // Cleanup resources on error
-    allTransports.forEach((transport) => transport.close());
-    allConsumers.forEach((consumer) => consumer.close());
-    throw error;
+  // Audio mixing
+  if (audioCount > 1) {
+    filterComplex = "[0:a][1:a]amix=inputs=2[audio_out];";
+  } else if (audioCount === 1) {
+    filterComplex = "[0:a]aresample=48000[audio_out];";
+  } else {
+    filterComplex =
+      "anullsrc=channel_layout=stereo:sample_rate=48000[audio_out];";
   }
+
+  // Video layout
+  const firstVideoIndex = audioCount;
+  if (videoCount === 2) {
+    filterComplex +=
+      `[${firstVideoIndex}:v]scale=640:480[left];` +
+      `[${firstVideoIndex + 1}:v]scale=640:480[right];` +
+      `[left][right]hstack=inputs=2[video_out]`;
+  } else if (videoCount === 1) {
+    filterComplex += `[${firstVideoIndex}:v]scale=1280:720[video_out]`;
+  }
+
+  return filterComplex;
+}
+
+function setupFFmpegEventHandlers(ffmpegProcess, outputDir) {
+  ffmpegProcess.stdout.on("data", (data) => {
+    logger.debug(`FFmpeg stdout: ${data.toString()}`);
+  });
+
+  ffmpegProcess.stderr.on("data", (data) => {
+    logger.debug(`FFmpeg stderr: ${data.toString()}`);
+  });
+
+  ffmpegProcess.on("close", (code) => {
+    logger.info(`FFmpeg process exited with code ${code}`);
+  });
+
+  ffmpegProcess.on("error", (err) => {
+    logger.error(`FFmpeg process error: ${err.message}`);
+  });
+}
+
+async function setupConsumerResumption(audioConsumers, videoConsumers, roomId) {
+  setTimeout(async () => {
+    try {
+      const allConsumers = [...audioConsumers, ...videoConsumers];
+
+      for (const consumer of allConsumers) {
+        if (consumer.kind === "video") {
+          await consumer.requestKeyFrame();
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        await consumer.resume();
+        logger.debug(`Resumed consumer ${consumer.id}`);
+      }
+
+      logger.info(`All consumers resumed for room ${roomId}`);
+
+      // Setup periodic keyframe requests
+      const keyframeInterval = setInterval(() => {
+        videoConsumers.forEach((consumer) => consumer.requestKeyFrame());
+      }, CONFIG.HLS.KEYFRAME_INTERVAL);
+
+      // Store interval for cleanup
+      const hlsProcess = hlsProcesses.get(roomId);
+      if (hlsProcess) {
+        hlsProcess.keyframeInterval = keyframeInterval;
+      }
+    } catch (error) {
+      logger.error(`Error resuming consumers: ${error.message}`);
+    }
+  }, 3000);
+}
+
+async function cleanupHLSResources(resources) {
+  const { transports, consumers, ffmpegProcess } = resources;
+
+  if (ffmpegProcess && !ffmpegProcess.killed) {
+    ffmpegProcess.kill("SIGTERM");
+  }
+
+  consumers.forEach((consumer) => {
+    if (!consumer.closed) consumer.close();
+  });
+
+  transports.forEach((transport) => {
+    if (!transport.closed) transport.close();
+  });
 }
 
 async function stopHLS(roomId) {
@@ -642,92 +827,124 @@ io.on("connection", (socket) => {
   });
 
   socket.on("createTransport", async (cb) => {
-    const transport = await router.createWebRtcTransport({
-      listenIps: [{ ip: "127.0.0.1", announcedIp: null }],
-      enableUdp: true,
-      enableTcp: true,
-      preferUdp: true,
-    });
+    try {
+      const transport = await router.createWebRtcTransport(CONFIG.TRANSPORT);
+      const peer = getPeer(socket.id);
+      peer.transports.add(transport);
 
-    getPeer(socket.id).transports.push(transport);
-
-    cb({
-      id: transport.id,
-      iceParameters: transport.iceParameters,
-      iceCandidates: transport.iceCandidates,
-      dtlsParameters: transport.dtlsParameters,
-    });
+      cb({
+        id: transport.id,
+        iceParameters: transport.iceParameters,
+        iceCandidates: transport.iceCandidates,
+        dtlsParameters: transport.dtlsParameters,
+      });
+    } catch (error) {
+      logger.error(
+        `Error creating transport for ${socket.id}: ${error.message}`
+      );
+      cb({ error: error.message });
+    }
   });
 
   socket.on("connectTransport", async ({ transportId, dtlsParameters }, cb) => {
-    const peer = getPeer(socket.id);
-    const transport = peer.transports.find((t) => t.id === transportId);
-    await transport.connect({ dtlsParameters });
-    cb();
+    try {
+      const peer = getPeer(socket.id);
+      const transport = Array.from(peer.transports).find(
+        (t) => t.id === transportId
+      );
+
+      if (!transport) {
+        throw new Error(`Transport ${transportId} not found`);
+      }
+
+      await transport.connect({ dtlsParameters });
+      cb({ success: true });
+    } catch (error) {
+      logger.error(
+        `Error connecting transport for ${socket.id}: ${error.message}`
+      );
+      cb({ error: error.message });
+    }
   });
 
   socket.on("produce", async ({ transportId, kind, rtpParameters }, cb) => {
-    const peer = getPeer(socket.id);
-    const transport = peer.transports.find((t) => t.id === transportId);
+    try {
+      const peer = getPeer(socket.id);
+      const transport = Array.from(peer.transports).find(
+        (t) => t.id === transportId
+      );
 
-    const producer = await transport.produce({ kind, rtpParameters });
-    peer.producers.push(producer);
+      if (!transport) {
+        throw new Error(`Transport ${transportId} not found`);
+      }
 
-    // Store producer in room data if in a room
-    const roomId = peer.roomId;
-    if (roomId) {
-      const room = rooms.get(roomId);
-      if (room) {
-        if (!room.producers.has(socket.id)) {
-          room.producers.set(socket.id, []);
+      const producer = await transport.produce({ kind, rtpParameters });
+      peer.producers.add(producer);
+
+      // Store producer in room data if in a room
+      const roomId = peer.roomId;
+      if (roomId) {
+        const room = rooms.get(roomId);
+        if (room) {
+          if (!room.producers.has(socket.id)) {
+            room.producers.set(socket.id, new Set());
+          }
+          room.producers.get(socket.id).add(producer);
+
+          // Notify other clients in the same room
+          socket.to(roomId).emit("newProducer", {
+            producerId: producer.id,
+            kind,
+            socketId: socket.id,
+          });
         }
-        room.producers.get(socket.id).push(producer);
-
-        // Notify other clients in the same room
-        socket.to(roomId).emit("newProducer", {
+      } else {
+        // Fallback to broadcasting to all if not in a room
+        socket.broadcast.emit("newProducer", {
           producerId: producer.id,
           kind,
           socketId: socket.id,
         });
       }
-    } else {
-      // Fallback to broadcasting to all if not in a room
-      socket.broadcast.emit("newProducer", {
-        producerId: producer.id,
-        kind,
-        socketId: socket.id,
-      });
-    }
 
-    cb({ id: producer.id });
+      cb({ id: producer.id });
+    } catch (error) {
+      logger.error(`Error producing for ${socket.id}: ${error.message}`);
+      cb({ error: error.message });
+    }
   });
 
   socket.on("getProducers", (cb) => {
-    const peer = getPeer(socket.id);
-    const roomId = peer.roomId;
+    try {
+      const peer = getPeer(socket.id);
+      const roomId = peer.roomId;
 
-    if (roomId && rooms.has(roomId)) {
-      // Get producers from the room
-      const room = rooms.get(roomId);
-      const producersList = [];
+      if (roomId && rooms.has(roomId)) {
+        const room = rooms.get(roomId);
+        const producersList = [];
 
-      room.producers.forEach((producers, otherSocketId) => {
-        if (otherSocketId !== socket.id) {
-          producers.forEach((producer) => {
-            producersList.push({
-              producerId: producer.id,
-              kind: producer.kind,
-              socketId: otherSocketId,
+        room.producers.forEach((producers, otherSocketId) => {
+          if (otherSocketId !== socket.id) {
+            producers.forEach((producer) => {
+              producersList.push({
+                producerId: producer.id,
+                kind: producer.kind,
+                socketId: otherSocketId,
+              });
             });
-          });
-        }
-      });
+          }
+        });
 
-      cb(producersList);
-    } else {
-      // If not in a room, return empty list
-      debug("Peer not in any room, no producers to get");
-      cb([]);
+        cb({ producers: producersList });
+      } else {
+        logger.debug(`Peer ${socket.id} not in any room, no producers to get`);
+        cb({ producers: [] });
+      }
+    } catch (error) {
+      logger.error(
+        `Error getting producers for ${socket.id}: ${error.message}`
+      );
+      cb({ error: error.message });
     }
   });
 
@@ -736,7 +953,13 @@ io.on("connection", (socket) => {
     async ({ producerId, rtpCapabilities, transportId }, cb) => {
       try {
         const peer = getPeer(socket.id);
-        const transport = peer.transports.find((t) => t.id === transportId);
+        const transport = Array.from(peer.transports).find(
+          (t) => t.id === transportId
+        );
+
+        if (!transport) {
+          throw new Error(`Transport ${transportId} not found`);
+        }
 
         const consumer = await transport.consume({
           producerId,
@@ -744,7 +967,7 @@ io.on("connection", (socket) => {
           paused: false,
         });
 
-        peer.consumers.push(consumer);
+        peer.consumers.add(consumer);
 
         // Store consumer in room data if in a room
         const roomId = peer.roomId;
@@ -752,9 +975,9 @@ io.on("connection", (socket) => {
           const room = rooms.get(roomId);
           if (room) {
             if (!room.consumers.has(socket.id)) {
-              room.consumers.set(socket.id, []);
+              room.consumers.set(socket.id, new Set());
             }
-            room.consumers.get(socket.id).push(consumer);
+            room.consumers.get(socket.id).add(consumer);
           }
         }
 
@@ -764,9 +987,9 @@ io.on("connection", (socket) => {
           kind: consumer.kind,
           rtpParameters: consumer.rtpParameters,
         });
-      } catch (err) {
-        console.error("Consume error:", err);
-        cb({ error: err.message });
+      } catch (error) {
+        logger.error(`Consume error for ${socket.id}: ${error.message}`);
+        cb({ error: error.message });
       }
     }
   );
@@ -805,38 +1028,56 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("disconnect", () => {
-    console.log("peer disconnected", socket.id);
+  socket.on("disconnect", async () => {
+    logger.info(`Peer disconnected: ${socket.id}`);
 
-    const peer = peers.get(socket.id);
-    if (peer) {
-      const roomId = peer.roomId;
+    try {
+      const peer = peers.get(socket.id);
+      if (peer) {
+        const roomId = peer.roomId;
 
-      // Remove peer from room
-      if (roomId && rooms.has(roomId)) {
-        const room = rooms.get(roomId);
-        room.peers.delete(socket.id);
-        room.producers.delete(socket.id);
-        room.consumers.delete(socket.id);
+        // Remove peer from room
+        if (roomId && rooms.has(roomId)) {
+          const room = rooms.get(roomId);
+          room.peers.delete(socket.id);
+          room.producers.delete(socket.id);
+          room.consumers.delete(socket.id);
 
-        // If room is empty, stop HLS and remove room
-        if (room.peers.size === 0) {
-          if (hlsProcesses.has(roomId)) {
-            stopHLS(roomId).catch((error) => {
-              console.error(`Error stopping HLS for room ${roomId}:`, error);
-            });
+          // If room is empty, stop HLS and remove room
+          if (room.peers.size === 0) {
+            if (hlsProcesses.has(roomId)) {
+              try {
+                await stopHLS(roomId);
+                logger.info(`HLS stopped for empty room ${roomId}`);
+              } catch (error) {
+                logger.error(
+                  `Error stopping HLS for room ${roomId}: ${error.message}`
+                );
+              }
+            }
+            rooms.delete(roomId);
+            logger.info(`Room ${roomId} deleted as it's empty`);
           }
-          rooms.delete(roomId);
-          debug(`Room ${roomId} deleted as it's empty`);
         }
+
+        // Clean up peer resources
+        peer.transports.forEach((transport) => {
+          if (!transport.closed) transport.close();
+        });
+        peer.producers.forEach((producer) => {
+          if (!producer.closed) producer.close();
+        });
+        peer.consumers.forEach((consumer) => {
+          if (!consumer.closed) consumer.close();
+        });
       }
 
-      peer.transports.forEach((t) => t.close());
-      peer.producers.forEach((p) => p.close());
-      peer.consumers.forEach((c) => c.close());
+      peers.delete(socket.id);
+    } catch (error) {
+      logger.error(
+        `Error during disconnect cleanup for ${socket.id}: ${error.message}`
+      );
     }
-
-    peers.delete(socket.id);
   });
 });
 

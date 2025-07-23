@@ -78,8 +78,17 @@ const StreamPage = () => {
           );
         });
 
-        // Get all existing producers
-        socket.emit("getProducers", async (producers: any[]) => {
+        // Get all existing producers - FIX: Access the producers array from the response object
+        socket.emit("getProducers", async (response: any) => {
+          // Handle both error case and success case
+          if (response.error) {
+            console.error("Error getting producers:", response.error);
+            return;
+          }
+
+          // The server returns { producers: [...] }, so we need to access the producers property
+          const producers = response.producers || [];
+
           for (const producer of producers) {
             await consumeRemote(producer.producerId, producer.kind);
           }
@@ -94,35 +103,57 @@ const StreamPage = () => {
           producerId: string,
           _kind: mediasoupClient.types.MediaKind
         ) => {
-          const consumerParams = await new Promise<any>((resolve) =>
-            socket.emit(
-              "consume",
-              {
-                producerId,
-                rtpCapabilities: device.rtpCapabilities,
-                transportId: recvTransportRef.current!.id,
-              },
-              resolve
-            )
-          );
+          try {
+            const consumerParams = await new Promise<any>((resolve, reject) =>
+              socket.emit(
+                "consume",
+                {
+                  producerId,
+                  rtpCapabilities: device.rtpCapabilities,
+                  transportId: recvTransportRef.current!.id,
+                },
+                (response: any) => {
+                  if (response.error) {
+                    reject(new Error(response.error));
+                  } else {
+                    resolve(response);
+                  }
+                }
+              )
+            );
 
-          const consumer = await recvTransportRef.current!.consume({
-            id: consumerParams.id,
-            producerId: consumerParams.producerId,
-            kind: consumerParams.kind,
-            rtpParameters: consumerParams.rtpParameters,
-          });
+            const consumer = await recvTransportRef.current!.consume({
+              id: consumerParams.id,
+              producerId: consumerParams.producerId,
+              kind: consumerParams.kind,
+              rtpParameters: consumerParams.rtpParameters,
+            });
 
-          const stream = new MediaStream([consumer.track]);
-          remoteVideoRef.current!.srcObject = stream;
-          remoteVideoRef.current!.play();
+            const stream = new MediaStream([consumer.track]);
+
+            // Handle multiple remote streams better
+            if (remoteVideoRef.current) {
+              const existingStream = remoteVideoRef.current
+                .srcObject as MediaStream;
+              if (existingStream) {
+                // Add new track to existing stream
+                existingStream.addTrack(consumer.track);
+              } else {
+                // Set new stream
+                remoteVideoRef.current.srcObject = stream;
+              }
+              remoteVideoRef.current.play().catch(console.error);
+            }
+          } catch (error) {
+            console.error("Error consuming remote stream:", error);
+          }
         };
 
         setJoined(true);
       });
     };
 
-    start();
+    start().catch(console.error);
   }, []);
 
   const handleStartHLS = () => {
