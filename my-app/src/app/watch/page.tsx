@@ -4,7 +4,7 @@ import Hls from "hls.js";
 
 const WatchPage = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const roomId = "room1"; // Change this if needed
+  const roomId = "room1";
 
   useEffect(() => {
     const video = videoRef.current;

@@ -24,9 +24,10 @@ const CONFIG = {
     FFMPEG_HOST: "127.0.0.1",
     AUDIO_PORT: 5004,
     VIDEO_BASE_PORT: 5008,
-    SEGMENT_DURATION: 2,
-    PLAYLIST_SIZE: 5,
-    KEYFRAME_INTERVAL: 5000,
+    SEGMENT_DURATION: 1,
+    PLAYLIST_SIZE: 3,
+    KEYFRAME_INTERVAL: 1000,
+    GOP_SIZE: 24,
   },
   TRANSPORT: {
     listenIps: [
@@ -525,14 +526,23 @@ function buildFFmpegArgs(audioConsumers, videoConsumers, outputDir) {
     "-loglevel",
     "error",
     "-y",
+
     "-fflags",
-    "+genpts+discardcorrupt+nobuffer",
+    "+genpts+discardcorrupt+nobuffer+flush_packets",
+    "-flags",
+    "+low_delay",
     "-avoid_negative_ts",
     "make_zero",
     "-thread_queue_size",
-    "1024",
+    "512", // Reduced from 1024
     "-protocol_whitelist",
     "file,udp,rtp,rtcp,crypto,data",
+
+    "-re", // Read input at native frame rate
+    "-probesize",
+    "32", // Minimal probe size
+    "-analyzeduration",
+    "0", // No analysis delay
   ];
 
   // Add audio inputs
@@ -544,6 +554,8 @@ function buildFFmpegArgs(audioConsumers, videoConsumers, outputDir) {
       "sdp",
       "-c:a",
       "libopus",
+      "-thread_queue_size",
+      "512",
       "-i",
       path.join(outputDir, `audio${i + 1}.sdp`)
     );
@@ -556,6 +568,8 @@ function buildFFmpegArgs(audioConsumers, videoConsumers, outputDir) {
       "file,udp,rtp,rtcp,crypto,data",
       "-f",
       "sdp",
+      "-thread_queue_size",
+      "512",
       "-i",
       path.join(outputDir, `video${i + 1}.sdp`)
     );
@@ -571,52 +585,88 @@ function buildFFmpegArgs(audioConsumers, videoConsumers, outputDir) {
 
   // Add encoding and HLS settings
   ffmpegArgs.push(
+    // Audio encoding - optimized for low latency
     "-c:a",
     "aac",
     "-b:a",
-    "192k",
+    "128k", // Reduced bitrate for faster encoding
     "-ar",
     "48000",
     "-ac",
     "2",
+    "-profile:a",
+    "aac_low",
+
+    // Video encoding - ultra-low latency preset
     "-c:v",
     "libx264",
     "-preset",
-    "veryfast",
+    "ultrafast", // Changed from veryfast to ultrafast
     "-tune",
     "zerolatency",
     "-profile:v",
-    "main",
+    "baseline", // Changed from main to baseline for faster decoding
     "-level",
-    "4.0",
+    "3.1", // Lower level for faster processing
+
+    // Bitrate settings - optimized for speed
     "-b:v",
-    "1500k",
+    "1000k", // Reduced from 1500k
     "-maxrate",
-    "1800k",
+    "1200k", // Reduced accordingly
     "-bufsize",
-    "3000k",
+    "2000k", // Reduced buffer size
+
+    // GOP settings for minimal latency
     "-g",
-    "48",
+    CONFIG.HLS.GOP_SIZE, // Small GOP size
     "-keyint_min",
-    "48",
+    CONFIG.HLS.GOP_SIZE,
     "-sc_threshold",
-    "0",
+    "0", // Disable scene change detection
+    "-force_key_frames",
+    "expr:gte(t,n_forced*1)", // Force keyframes every second
+
+    // Frame rate and threading
     "-r",
-    "24",
+    "30", // Increased from 24 to 30fps
+    "-threads",
+    "4", // Limit threads for faster encoding
+    "-thread_type",
+    "frame+slice",
+
+    // HLS-specific ultra-low latency settings
     "-f",
     "hls",
     "-hls_time",
     CONFIG.HLS.SEGMENT_DURATION.toString(),
     "-hls_list_size",
     CONFIG.HLS.PLAYLIST_SIZE.toString(),
+
+    // Critical low-latency HLS flags
     "-hls_flags",
-    "delete_segments+append_list+discont_start+omit_endlist",
+    "delete_segments+append_list+discont_start+omit_endlist+independent_segments",
     "-hls_delete_threshold",
     "1",
     "-hls_segment_type",
     "mpegts",
+
+    // Low-latency specific settings
+    "-hls_init_time",
+    "0", // No initial delay
+    "-hls_allow_cache",
+    "0", // Disable caching
+    "-start_number",
+    "0",
+    "-hls_start_number_source",
+    "epoch",
+
+    // Output settings
     "-hls_segment_filename",
     path.join(outputDir, "segment_%d.ts"),
+    "-method",
+    "PUT", // Use PUT for better real-time performance
+
     path.join(outputDir, "index.m3u8")
   );
 
@@ -626,31 +676,31 @@ function buildFFmpegArgs(audioConsumers, videoConsumers, outputDir) {
 function buildFilterComplex(audioCount, videoCount) {
   let filterComplex = "";
 
-  // Audio mixing
+  // Audio mixing with minimal latency
   if (audioCount > 1) {
-    filterComplex = "[0:a][1:a]amix=inputs=2[audio_out];";
+    filterComplex =
+      "[0:a][1:a]amix=inputs=2:duration=shortest:normalize=0[audio_out];";
   } else if (audioCount === 1) {
-    filterComplex = "[0:a]aresample=48000[audio_out];";
+    filterComplex = "[0:a]aresample=48000:async=1[audio_out];";
   } else {
     filterComplex =
       "anullsrc=channel_layout=stereo:sample_rate=48000[audio_out];";
   }
 
-  // Video layout
+  // Video layout with performance optimization
   const firstVideoIndex = audioCount;
   if (videoCount === 2) {
     filterComplex +=
-      `[${firstVideoIndex}:v]scale=640:480[left];` +
-      `[${firstVideoIndex + 1}:v]scale=640:480[right];` +
-      `[left][right]hstack=inputs=2[video_out]`;
+      `[${firstVideoIndex}:v]scale=640:480:flags=fast_bilinear[left];` +
+      `[${firstVideoIndex + 1}:v]scale=640:480:flags=fast_bilinear[right];` +
+      `[left][right]hstack=inputs=2:shortest=1[video_out]`;
   } else if (videoCount === 1) {
-    filterComplex += `[${firstVideoIndex}:v]scale=1280:720[video_out]`;
+    filterComplex += `[${firstVideoIndex}:v]scale=1280:720:flags=fast_bilinear[video_out]`;
   }
 
   return filterComplex;
 }
-
-function setupFFmpegEventHandlers(ffmpegProcess, outputDir) {
+function setupFFmpegEventHandlers(ffmpegProcess) {
   ffmpegProcess.stdout.on("data", (data) => {
     logger.debug(`FFmpeg stdout: ${data.toString()}`);
   });
@@ -669,24 +719,28 @@ function setupFFmpegEventHandlers(ffmpegProcess, outputDir) {
 }
 
 async function setupConsumerResumption(audioConsumers, videoConsumers, roomId) {
+  // Reduced delay from 3000ms to 1000ms for faster startup
   setTimeout(async () => {
     try {
       const allConsumers = [...audioConsumers, ...videoConsumers];
 
-      for (const consumer of allConsumers) {
+      // Resume all consumers simultaneously instead of sequentially
+      const resumePromises = allConsumers.map(async (consumer) => {
         if (consumer.kind === "video") {
           await consumer.requestKeyFrame();
-          await new Promise((resolve) => setTimeout(resolve, 500));
         }
         await consumer.resume();
         logger.debug(`Resumed consumer ${consumer.id}`);
-      }
+      });
 
+      await Promise.all(resumePromises);
       logger.info(`All consumers resumed for room ${roomId}`);
 
-      // Setup periodic keyframe requests
+      // More frequent keyframe requests for lower latency
       const keyframeInterval = setInterval(() => {
-        videoConsumers.forEach((consumer) => consumer.requestKeyFrame());
+        videoConsumers.forEach((consumer) => {
+          consumer.requestKeyFrame().catch(() => {}); // Ignore errors
+        });
       }, CONFIG.HLS.KEYFRAME_INTERVAL);
 
       // Store interval for cleanup
@@ -697,25 +751,34 @@ async function setupConsumerResumption(audioConsumers, videoConsumers, roomId) {
     } catch (error) {
       logger.error(`Error resuming consumers: ${error.message}`);
     }
-  }, 3000);
+  }, 1000); // Reduced from 3000ms
 }
 
 async function cleanupHLSResources(resources) {
   const { transports, consumers, ffmpegProcess } = resources;
 
   if (ffmpegProcess && !ffmpegProcess.killed) {
+    // Send SIGTERM first, then SIGKILL if needed
     ffmpegProcess.kill("SIGTERM");
+    setTimeout(() => {
+      if (!ffmpegProcess.killed) {
+        ffmpegProcess.kill("SIGKILL");
+      }
+    }, 2000);
   }
 
-  consumers.forEach((consumer) => {
-    if (!consumer.closed) consumer.close();
-  });
+  // Close consumers and transports in parallel
+  const cleanupPromises = [
+    ...consumers.map((consumer) => {
+      if (!consumer.closed) return consumer.close();
+    }),
+    ...transports.map((transport) => {
+      if (!transport.closed) return transport.close();
+    }),
+  ].filter(Boolean);
 
-  transports.forEach((transport) => {
-    if (!transport.closed) transport.close();
-  });
+  await Promise.allSettled(cleanupPromises);
 }
-
 async function stopHLS(roomId) {
   debug(`Stopping HLS for room ${roomId}`);
 
